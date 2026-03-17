@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import time
-from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -21,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision
 from gen2.script.constants import (
     MAX_MODEL_SCORE_THRESHOLD_GEN2,
@@ -254,6 +254,31 @@ class EgoblurDetector:
         img_tensor = torch.from_numpy(img)
         return img_tensor.to(self.device)
 
+    @staticmethod
+    def compute_resize_dims(
+        h: int, w: int, short_edge: int, max_size: int
+    ) -> Tuple[int, int]:
+        """
+        Compute target (new_h, new_w) matching ResizeShortestEdge logic.
+
+        Args:
+            h: Original height.
+            w: Original width.
+            short_edge: Target shortest edge length.
+            max_size: Maximum allowed dimension.
+
+        Returns:
+            Tuple of (new_h, new_w).
+        """
+        scale = float(short_edge) / min(h, w)
+        new_h = h * scale
+        new_w = w * scale
+        if max(new_h, new_w) > max_size:
+            scale = float(max_size) / max(new_h, new_w)
+            new_h *= scale
+            new_w *= scale
+        return int(new_h + 0.5), int(new_w + 0.5)
+
     def pre_process(
         self, bgr_image_batch: torch.Tensor
     ) -> Tuple[torch.Tensor, List[Tuple[int, int]], List[Tuple[int, int]]]:
@@ -280,6 +305,38 @@ class EgoblurDetector:
 
         img_tensor_list = [self.transform_image(im_np) for im_np in img_batch]
         return torch.stack(img_tensor_list), orig_img_hw_list, model_input_hw_list
+
+    def pre_process_gpu(
+        self, bgr_image_batch: torch.Tensor
+    ) -> Tuple[torch.Tensor, List[Tuple[int, int]], List[Tuple[int, int]]]:
+        """
+        GPU-only preprocessing: resize via F.interpolate without CPU roundtrip.
+
+        Args:
+            bgr_image_batch: Batched tensor shaped ``B x C x H x W`` on GPU in BGR order.
+
+        Returns:
+            Same signature as ``pre_process``.
+        """
+        B, C, H, W = bgr_image_batch.shape
+        orig_img_hw_list: List[Tuple[int, int]] = [(H, W)] * B
+
+        if self.aug is not None:
+            short_edge = self.aug.short_edge_length[0]
+            max_size = self.aug.max_size
+            new_h, new_w = self.compute_resize_dims(H, W, short_edge, max_size)
+            if (new_h, new_w) != (H, W):
+                bgr_image_batch = F.interpolate(
+                    bgr_image_batch.float(),
+                    size=(new_h, new_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(bgr_image_batch.dtype)
+            model_input_hw_list: List[Tuple[int, int]] = [(new_h, new_w)] * B
+        else:
+            model_input_hw_list = orig_img_hw_list
+
+        return bgr_image_batch, orig_img_hw_list, model_input_hw_list
 
     def inference(
         self, image_batch: torch.Tensor
@@ -362,6 +419,7 @@ class EgoblurDetector:
         detections_batch: List[Optional[FrameDetections]] = []
         for boxes, scores in zip(batch_boxes, batch_scores):
             if not boxes.any():
+                detections_batch.append(None)
                 continue
 
             detections = FrameDetections(
@@ -399,7 +457,6 @@ class EgoblurDetector:
                 * NumPy arrays of post-processed boxes in XYXY order.
                 * NumPy arrays of per-box scores.
         """
-        preds0 = deepcopy(preds0)
         preds: List[Instances] = []
         if self.tscript_type == "trace":
             boxes = scores = labels = None

@@ -38,6 +38,7 @@ Source = "https://github.com/facebookresearch/egoblur"
 [project.entry-points."console_scripts"]
 egoblur-gen1 = "gen1.script.demo_ego_blur_gen1:main"
 egoblur-gen2 = "gen2.script.demo_ego_blur_gen2:main"
+egoblur-gen2-fast = "gen2.script.demo_ego_blur_gen2_fast:main"
 
 [tool.setuptools]
 include-package-data = true
